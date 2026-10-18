@@ -7,6 +7,7 @@ Para producción (50-70 TIFF) irá la versión de escritorio.
 """
 
 import io, zipfile, os
+import numpy as np
 from PIL import Image, ImageFilter
 import streamlit as st
 
@@ -28,40 +29,35 @@ def quitar_fondo(pil_img, model_name, alpha_matting):
     )
     return out.convert("RGBA")
 
-# ---------- Montaje: MISMO marco + sombra de suelo ----------
-def componer(cut_rgba, bg=(255, 255, 255), con_sombra=True, sombra_op=0.35, tipo="suelo"):
+# ---------- Montaje: MISMO marco + sombra de suelo (abajo-izquierda) ----------
+def componer(cut_rgba, bg=(255, 255, 255), con_sombra=True, sombra_op=0.40, lado="izquierda"):
+    """Proyecta la sombra en el suelo hacia abajo-izquierda (luz desde arriba-derecha).
+    Un degradado vertical la desvanece hacia arriba, así la cadena/asa no deja reguero."""
     cut = cut_rgba.convert("RGBA")
     W, H = cut.size                         # mismo tamaño/encuadre que la original
     canvas = Image.new("RGB", (W, H), bg)
     if con_sombra:
         a = cut.split()[-1]
-        bbox = a.getbbox()                  # (izq, arriba, der, abajo) del objeto
-        if bbox:
-            l, t, r, b = bbox
-            obj_w, obj_h = r - l, b - t
-            black = Image.new("RGBA", (W, H), (0, 0, 0, 255))
-            vacio = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-            sil = Image.composite(black, vacio, a)         # silueta negra a marco completo
-            shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        black = Image.new("RGBA", (W, H), (0, 0, 0, 255))
+        vacio = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        sil = Image.composite(black, vacio, a)             # silueta negra a marco completo
 
-            if tipo == "suelo":
-                # sombra de suelo: silueta aplastada en vertical, anclada en la base,
-                # leve desplazamiento a la izquierda (luz desde arriba-derecha)
-                new_h = max(2, int(obj_h * 0.16))
-                sil_crop = sil.crop(bbox).resize((obj_w, new_h))
-                off_x = l - int(obj_w * 0.06)
-                off_y = b - int(new_h * 0.55)
-                shadow.paste(sil_crop, (off_x, off_y), sil_crop)
-                blur = max(14, int(obj_w * 0.05))
-            else:  # "proyectada": silueta entera lanzada abajo-izquierda
-                shadow.paste(sil, (-int(obj_w * 0.06), int(obj_h * 0.05)), sil)
-                blur = max(18, int(obj_w * 0.04))
+        dx = int(W * (-0.10 if lado == "izquierda" else 0.10))
+        dy = int(H * 0.05)
+        shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        shadow.paste(sil, (dx, dy), sil)
+        shadow = shadow.filter(ImageFilter.GaussianBlur(max(8, int(W * 0.055))))
 
-            shadow = shadow.filter(ImageFilter.GaussianBlur(blur))
-            rr, gg, bb, al = shadow.split()
-            al = al.point(lambda v: int(v * sombra_op))
-            shadow = Image.merge("RGBA", (rr, gg, bb, al))
-            canvas.paste(shadow, (0, 0), shadow)
+        # degradado vertical: 0 arriba -> 1 abajo (desvanece la parte alta = cadena/asa)
+        fade = 0.42
+        ys = np.clip((np.linspace(0, 1, H) - fade) / (1 - fade), 0, 1)
+        ramp = np.tile(ys[:, None], (1, W))
+
+        rr, gg, bb, al = shadow.split()
+        al = (np.array(al, dtype="float32") * ramp * sombra_op)
+        al = Image.fromarray(np.clip(al, 0, 255).astype("uint8"))
+        shadow = Image.merge("RGBA", (rr, gg, bb, al))
+        canvas.paste(shadow, (0, 0), shadow)
     canvas.paste(cut, (0, 0), cut)
     return canvas
 
@@ -95,10 +91,9 @@ with c1:
     st.caption(f"RGB {bg[0]}, {bg[1]}, {bg[2]}")
 with c2:
     sombra = st.checkbox("Sombra de suelo", value=True)
-    tipo_sombra = st.radio("Tipo de sombra", ["suelo", "proyectada"],
-                           help="'suelo' = charco suave bajo la base (apoyado en una superficie). "
-                                "'proyectada' = silueta lanzada hacia abajo-izquierda.")
-    sombra_op = st.slider("Intensidad de la sombra", 0.0, 0.6, 0.35, 0.05)
+    lado = st.radio("Lado de la sombra", ["izquierda", "derecha"], horizontal=True,
+                    help="Hacia dónde cae la sombra en el suelo (según de dónde venga la luz).")
+    sombra_op = st.slider("Intensidad de la sombra", 0.0, 0.7, 0.40, 0.05)
 
 with st.expander("⚙ Opciones avanzadas del recorte"):
     modelo = st.selectbox("Modelo", ["u2net", "isnet-general-use", "birefnet-general"],
@@ -121,7 +116,7 @@ if fotos:
             except Exception as e:
                 st.error(f"Error con {f.name}: {e}")
                 continue
-            out = componer(cut, bg, sombra, sombra_op, tipo_sombra)
+            out = componer(cut, bg, sombra, sombra_op, lado)
             resultados.append((os.path.splitext(f.name)[0] + ".jpg", out))
             barra.progress((i + 1) / len(fotos))
         barra.empty()
